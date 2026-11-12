@@ -1,0 +1,7 @@
+node_modules
+.git
+.vercel
+.env
+_t.mjs
+README.md
+form.html
