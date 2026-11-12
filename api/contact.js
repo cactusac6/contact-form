@@ -8,7 +8,7 @@ import Busboy from 'busboy';
 
 const MAX_FILES = 3;
 const MAX_FILE_BYTES = 5 * 1024 * 1024; // 5 MB
-const ALLOWED_MIME = ['image/jpeg', 'image/png'];
+const ALLOWED_MIME = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -36,15 +36,26 @@ export default async function handler(req, res) {
     }
 
     // Honeypot — tiché "success" pro boty
-    const honeypot = fields._honeypot || fields.website;
+    const honeypot = fields._honeypot || fields._honey || fields.website;
     if (honeypot) {
-      return res.status(200).json({ ok: true });
+      return res.status(200).json({ ok: true, success: true });
     }
 
-    const name = (fields.name || `${fields.jmeno || ''} ${fields.prijmeni || ''}`).trim();
-    const email = (fields.email || '').trim();
-    const phone = (fields.telefon || fields.phone || '').trim();
-    const message = (fields.zprava || fields.message || '').trim();
+    // Pole hledáme bez ohledu na velikost písmen a diakritiku (Jméno, E-mail, Telefon, Zpráva…)
+    const norm = (k) => String(k).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+    const nf = {};
+    for (const [k, v] of Object.entries(fields)) nf[norm(k)] = String(v ?? '').trim();
+    const pick = (...keys) => { for (const k of keys) if (nf[k]) return nf[k]; return ''; };
+
+    const name = (pick('name', 'jmeno') && !nf.prijmeni ? pick('name', 'jmeno') : `${pick('name', 'jmeno')} ${nf.prijmeni || ''}`).trim();
+    const email = pick('email', 'e-mail');
+    const phone = pick('telefon', 'phone', 'tel');
+    const message = pick('zprava', 'message', 'popis poptavky', 'popis projektu', 'motiv', 'poznamka', 'dotaz');
+
+    // Všechna ostatní (viditelná) pole půjdou do e-mailu jako tabulka
+    const extraRows = Object.entries(fields)
+      .filter(([k, v]) => !k.startsWith('_') && k !== 'website' && String(v ?? '').trim())
+      .map(([k, v]) => [k, String(v).trim()]);
 
     if (oversizedFile) {
       return res.status(400).json({ ok: false, error: `Soubor „${oversizedFile}“ je větší než 5 MB.` });
@@ -54,7 +65,7 @@ export default async function handler(req, res) {
     }
     for (const f of files) {
       if (!ALLOWED_MIME.includes(f.mimetype)) {
-        return res.status(400).json({ ok: false, error: `Soubor „${f.filename}“ musí být JPG nebo PNG.` });
+        return res.status(400).json({ ok: false, error: `Soubor „${f.filename}“ musí být JPG, PNG, WebP nebo PDF.` });
       }
     }
 
@@ -62,13 +73,17 @@ export default async function handler(req, res) {
     if (!name) errors.name = 'Vyplňte jméno.';
     if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) errors.email = 'Zadejte platný e-mail.';
     if (!email && !phone) errors.contact = 'Vyplňte e-mail nebo telefon.';
-    if (!message) errors.message = 'Vyplňte zprávu.';
+    if (!message && extraRows.length < 3) errors.message = 'Vyplňte zprávu.';
 
     if (Object.keys(errors).length > 0) {
       return res.status(400).json({ ok: false, error: 'Neplatná data.', fields: errors });
     }
 
-    const toEmail = process.env.TO_EMAIL;
+    // Příjemce podle webu: SITE_RECIPIENTS = {"sedlacek":"klient@firma.cz", ...}, fallback TO_EMAIL
+    let recipients = {};
+    try { recipients = JSON.parse(process.env.SITE_RECIPIENTS || '{}'); } catch { /* špatný JSON → fallback */ }
+    const siteKey = String(fields._site || '').trim().toLowerCase();
+    const toEmail = recipients[siteKey] || process.env.TO_EMAIL;
     const apiKey = process.env.RESEND_API_KEY;
     if (!toEmail || !apiKey) {
       console.error('Chybí RESEND_API_KEY nebo TO_EMAIL v env.');
@@ -78,13 +93,12 @@ export default async function handler(req, res) {
     const siteTag = fields._site ? ` (${escapeHtml(fields._site)})` : '';
     const subject = fields._subject || `Nová poptávka od ${name}`;
 
+    const rows = extraRows
+      .map(([k, v]) => `<tr><td style="padding:6px 14px 6px 0;color:#666;vertical-align:top"><strong>${escapeHtml(k)}</strong></td><td style="padding:6px 0">${escapeHtml(v).replace(/\n/g, '<br>')}</td></tr>`)
+      .join('');
     const html = `
       <h2>Nová poptávka z webu${siteTag}</h2>
-      <p><strong>Jméno:</strong> ${escapeHtml(name)}</p>
-      <p><strong>E-mail:</strong> ${escapeHtml(email || '-')}</p>
-      <p><strong>Telefon:</strong> ${escapeHtml(phone || '-')}</p>
-      <p><strong>Zpráva:</strong></p>
-      <p>${escapeHtml(message).replace(/\n/g, '<br>')}</p>
+      <table style="border-collapse:collapse;font-family:sans-serif;font-size:15px">${rows}</table>
       ${files.length ? `<p><strong>Přílohy:</strong> ${files.length} foto v příloze tohoto e-mailu.</p>` : ''}
     `;
 
@@ -95,6 +109,7 @@ export default async function handler(req, res) {
       html,
     };
     if (email) payload.reply_to = email;
+    if (process.env.BCC_EMAIL && process.env.BCC_EMAIL !== toEmail) payload.bcc = [process.env.BCC_EMAIL];
     if (files.length) {
       payload.attachments = files.map((f) => ({
         filename: f.filename || 'foto.jpg',
@@ -117,7 +132,7 @@ export default async function handler(req, res) {
       return res.status(502).json({ ok: false, error: 'Odeslání e-mailu se nezdařilo.' });
     }
 
-    return res.status(200).json({ ok: true });
+    return res.status(200).json({ ok: true, success: true });
   } catch (err) {
     console.error('Contact form error:', err);
     return res.status(500).json({ ok: false, error: 'Interní chyba serveru.' });
@@ -137,7 +152,7 @@ function parseMultipart(req, contentType) {
     let fileCount = 0;
 
     bb.on('field', (name, val) => {
-      fields[name] = val;
+      fields[name] = fields[name] ? `${fields[name]}, ${val}` : val; // více hodnot (checkboxy)
     });
 
     bb.on('file', (name, stream, info) => {
