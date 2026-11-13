@@ -143,6 +143,8 @@ function parseMultipart(req, contentType) {
   return new Promise((resolve, reject) => {
     const bb = Busboy({
       headers: { 'content-type': contentType },
+      defCharset: 'utf8',
+      defParamCharset: 'utf8', // názvy polí s diakritikou (Jméno, Zpráva) z FormData
       limits: { fileSize: MAX_FILE_BYTES, files: MAX_FILES + 1 },
     });
     const fields = {};
