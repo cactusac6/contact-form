@@ -9,15 +9,80 @@ import Busboy from 'busboy';
 const MAX_FILES = 3;
 const MAX_FILE_BYTES = 5 * 1024 * 1024; // 5 MB
 const ALLOWED_MIME = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
+const MAX_JSON_BYTES = 100 * 1024; // 100 kB
+const MAX_FIELD_CHARS = 5000;      // jedno pole (zpráva)
+const MAX_NAME_CHARS = 100;
+
+// Povolené domény webů (env ALLOWED_ORIGINS="abuildcz.cz,elrad.cz,..."; "*.domena.cz" = i subdomény).
+// Prázdné = bez omezení (zpětná kompatibilita). Povoluje i variantu s www.
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
+function originAllowed(origin) {
+  if (!ALLOWED_ORIGINS.length) return true;
+  if (!origin) return false; // prohlížeče posílají Origin u každého POST; chybí = skript/curl
+  let host;
+  try { host = new URL(origin).hostname.toLowerCase(); } catch { return false; }
+  return ALLOWED_ORIGINS.some((a) => {
+    if (a.startsWith('*.')) return host === a.slice(2) || host.endsWith(a.slice(1));
+    return host === a || host === `www.${a}`;
+  });
+}
+
+// Rate limit v paměti: na IP, na web i celkově (běží jeden kontejner).
+const RL = { ip: new Map(), site: new Map(), all: [] };
+const LIMITS = { ipMax: 8, ipWindow: 10 * 60e3, siteMax: 40, siteWindow: 60 * 60e3, allMax: 300, allWindow: 60 * 60e3 };
+function hit(map, key, max, windowMs, now) {
+  const arr = (map.get(key) || []).filter((t) => now - t < windowMs);
+  if (arr.length >= max) { map.set(key, arr); return false; }
+  arr.push(now); map.set(key, arr); return true;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, arr] of RL.ip) { const f = arr.filter((t) => now - t < LIMITS.ipWindow); f.length ? RL.ip.set(k, f) : RL.ip.delete(k); }
+  for (const [k, arr] of RL.site) { const f = arr.filter((t) => now - t < LIMITS.siteWindow); f.length ? RL.site.set(k, f) : RL.site.delete(k); }
+  RL.all = RL.all.filter((t) => now - t < LIMITS.allWindow);
+}, 5 * 60e3).unref();
+function clientIp(req) {
+  const xff = String(req.headers['x-forwarded-for'] || '').split(',').map((x) => x.trim()).filter(Boolean);
+  return xff[xff.length - 1] || req.socket?.remoteAddress || 'unknown'; // poslední = to, co viděl proxy (nelze podvrhnout)
+}
+
+// Kontrola skutečného typu souboru (ne jen deklarovaného prohlížečem)
+function magicOk(buf, mime) {
+  if (!buf || buf.length < 12) return false;
+  if (mime === 'image/jpeg') return buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
+  if (mime === 'image/png') return buf.slice(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  if (mime === 'image/webp') return buf.slice(0, 4).toString() === 'RIFF' && buf.slice(8, 12).toString() === 'WEBP';
+  if (mime === 'application/pdf') return buf.slice(0, 5).toString() === '%PDF-';
+  return false;
+}
+const safeFilename = (n) => String(n || 'priloha').replace(/[^\w.\- ]+/g, '_').slice(0, 80) || 'priloha';
 
 export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  const origin = req.headers.origin || '';
+  const allowed = originAllowed(origin);
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGINS.length ? (allowed ? origin : 'null') : '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
 
-  if (req.method === 'OPTIONS') return res.status(200).end();
+  if (req.method === 'OPTIONS') return res.status(allowed ? 200 : 403).end();
   if (req.method !== 'POST') {
     return res.status(405).json({ ok: false, error: 'Method not allowed' });
+  }
+  if (!allowed) {
+    console.warn('Zamítnuto: nepovolený Origin', origin || '(žádný)');
+    return res.status(403).json({ ok: false, error: 'Odeslání z této adresy není povoleno.' });
+  }
+  {
+    const now = Date.now();
+    const ok = hit(RL.ip, clientIp(req), LIMITS.ipMax, LIMITS.ipWindow, now)
+      && RL.all.filter((t) => now - t < LIMITS.allWindow).length < LIMITS.allMax;
+    if (!ok) {
+      res.setHeader('Retry-After', '600');
+      return res.status(429).json({ ok: false, error: 'Příliš mnoho odeslání. Zkuste to prosím za chvíli.' });
+    }
+    RL.all.push(now);
   }
 
   try {
@@ -64,12 +129,15 @@ export default async function handler(req, res) {
       return res.status(400).json({ ok: false, error: 'Maximálně 3 soubory.' });
     }
     for (const f of files) {
-      if (!ALLOWED_MIME.includes(f.mimetype)) {
+      if (!ALLOWED_MIME.includes(f.mimetype) || !magicOk(f.buffer, f.mimetype)) {
         return res.status(400).json({ ok: false, error: `Soubor „${f.filename}“ musí být JPG, PNG, WebP nebo PDF.` });
       }
     }
 
     const errors = {};
+    if (name.length > MAX_NAME_CHARS) errors.name = 'Jméno je příliš dlouhé.';
+    if (email.length > 254 || phone.length > 40) errors.contact = 'Kontakt je příliš dlouhý.';
+    if (extraRows.length > 40 || extraRows.some(([k, v]) => k.length > 100 || v.length > MAX_FIELD_CHARS)) errors.message = 'Text je příliš dlouhý.';
     if (!name) errors.name = 'Vyplňte jméno.';
     if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) errors.email = 'Zadejte platný e-mail.';
     if (!email && !phone) errors.contact = 'Vyplňte e-mail nebo telefon.';
@@ -83,15 +151,22 @@ export default async function handler(req, res) {
     let recipients = {};
     try { recipients = JSON.parse(process.env.SITE_RECIPIENTS || '{}'); } catch { /* špatný JSON → fallback */ }
     const siteKey = String(fields._site || '').trim().toLowerCase();
-    const toEmail = recipients[siteKey] || process.env.TO_EMAIL;
+    const knownSite = Object.prototype.hasOwnProperty.call(recipients, siteKey);
+    if (!hit(RL.site, siteKey || '_none', LIMITS.siteMax, LIMITS.siteWindow, Date.now())) {
+      res.setHeader('Retry-After', '3600');
+      return res.status(429).json({ ok: false, error: 'Příliš mnoho odeslání. Zkuste to prosím později.' });
+    }
+    if (!knownSite) console.warn('Neznámý _site:', JSON.stringify(siteKey).slice(0, 60));
+    const toEmail = knownSite ? recipients[siteKey] : process.env.TO_EMAIL;
     const apiKey = process.env.RESEND_API_KEY;
     if (!toEmail || !apiKey) {
       console.error('Chybí RESEND_API_KEY nebo TO_EMAIL v env.');
       return res.status(500).json({ ok: false, error: 'Server není nakonfigurován.' });
     }
 
-    const siteTag = fields._site ? ` (${escapeHtml(fields._site)})` : '';
-    const subject = fields._subject || `Nová poptávka od ${name}`;
+    const siteTag = fields._site ? ` (${escapeHtml(String(fields._site).slice(0, 40))})` : '';
+    const cleanSubject = String(fields._subject || '').replace(/[\r\n\u2028\u2029]+/g, ' ').trim().slice(0, 120);
+    const subject = `${knownSite ? '' : '[NEZNÁMÝ WEB] '}${cleanSubject || `Nová poptávka od ${name}`.slice(0, 120)}`;
 
     const rows = extraRows
       .map(([k, v]) => `<tr><td style="padding:6px 14px 6px 0;color:#666;vertical-align:top"><strong>${escapeHtml(k)}</strong></td><td style="padding:6px 0">${escapeHtml(v).replace(/\n/g, '<br>')}</td></tr>`)
@@ -112,7 +187,7 @@ export default async function handler(req, res) {
     if (process.env.BCC_EMAIL && process.env.BCC_EMAIL !== toEmail) payload.bcc = [process.env.BCC_EMAIL];
     if (files.length) {
       payload.attachments = files.map((f) => ({
-        filename: f.filename || 'foto.jpg',
+        filename: safeFilename(f.filename),
         content: f.buffer.toString('base64'),
       }));
     }
@@ -145,7 +220,7 @@ function parseMultipart(req, contentType) {
       headers: { 'content-type': contentType },
       defCharset: 'utf8',
       defParamCharset: 'utf8', // názvy polí s diakritikou (Jméno, Zpráva) z FormData
-      limits: { fileSize: MAX_FILE_BYTES, files: MAX_FILES + 1 },
+      limits: { fileSize: MAX_FILE_BYTES, files: MAX_FILES + 1, fields: 60, fieldSize: 20000, parts: 70 },
     });
     const fields = {};
     const files = [];
@@ -187,6 +262,7 @@ function parseJsonBody(req) {
     let data = '';
     req.on('data', (chunk) => {
       data += chunk;
+      if (data.length > MAX_JSON_BYTES) { data = ''; req.destroy(); }
     });
     req.on('end', () => {
       try {
