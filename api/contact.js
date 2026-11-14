@@ -29,7 +29,7 @@ function originAllowed(origin) {
 
 // Rate limit v paměti: na IP, na web i celkově (běží jeden kontejner).
 const RL = { ip: new Map(), site: new Map(), all: [] };
-const LIMITS = { ipMax: 8, ipWindow: 10 * 60e3, siteMax: 40, siteWindow: 60 * 60e3, allMax: 300, allWindow: 60 * 60e3 };
+const LIMITS = { ipMax: 30, ipWindow: 10 * 60e3, siteMax: 40, siteWindow: 60 * 60e3, allMax: 300, allWindow: 60 * 60e3 };
 function hit(map, key, max, windowMs, now) {
   const arr = (map.get(key) || []).filter((t) => now - t < windowMs);
   if (arr.length >= max) { map.set(key, arr); return false; }
@@ -74,17 +74,6 @@ export default async function handler(req, res) {
     console.warn('Zamítnuto: nepovolený Origin', origin || '(žádný)');
     return res.status(403).json({ ok: false, error: 'Odeslání z této adresy není povoleno.' });
   }
-  {
-    const now = Date.now();
-    const ok = hit(RL.ip, clientIp(req), LIMITS.ipMax, LIMITS.ipWindow, now)
-      && RL.all.filter((t) => now - t < LIMITS.allWindow).length < LIMITS.allMax;
-    if (!ok) {
-      res.setHeader('Retry-After', '600');
-      return res.status(429).json({ ok: false, error: 'Příliš mnoho odeslání. Zkuste to prosím za chvíli.' });
-    }
-    RL.all.push(now);
-  }
-
   try {
     const contentType = req.headers['content-type'] || '';
     let fields = {};
@@ -100,10 +89,22 @@ export default async function handler(req, res) {
       fields = await parseJsonBody(req);
     }
 
-    // Honeypot — tiché "success" pro boty
+    // Honeypot — tiché "success" pro boty (PŘED rate limitem, aby boti neblokovali reálné uživatele)
     const honeypot = fields._honeypot || fields._honey || fields.website;
     if (honeypot) {
       return res.status(200).json({ ok: true, success: true });
+    }
+
+    // Rate limit na IP a celkově (až po honeypotu — boti se nepočítají)
+    {
+      const now = Date.now();
+      const ok = hit(RL.ip, clientIp(req), LIMITS.ipMax, LIMITS.ipWindow, now)
+        && RL.all.filter((t) => now - t < LIMITS.allWindow).length < LIMITS.allMax;
+      if (!ok) {
+        res.setHeader('Retry-After', '600');
+        return res.status(429).json({ ok: false, error: 'Příliš mnoho odeslání. Zkuste to prosím za chvíli.' });
+      }
+      RL.all.push(now);
     }
 
     // Pole hledáme bez ohledu na velikost písmen a diakritiku (Jméno, E-mail, Telefon, Zpráva…)
