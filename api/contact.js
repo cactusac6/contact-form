@@ -114,8 +114,13 @@ export default async function handler(req, res) {
     const pick = (...keys) => { for (const k of keys) if (nf[k]) return nf[k]; return ''; };
 
     const name = (pick('name', 'jmeno') && !nf.prijmeni ? pick('name', 'jmeno') : `${pick('name', 'jmeno')} ${nf.prijmeni || ''}`).trim();
-    const email = pick('email', 'e-mail');
-    const phone = pick('telefon', 'phone', 'tel');
+    let email = pick('email', 'e-mail');
+    let phone = pick('telefon', 'phone', 'tel');
+    // Jedno společné pole "kontakt" (e-mail nebo telefon) — rozpoznat podle zavináče
+    if (!email && !phone) {
+      const kontakt = pick('kontakt', 'contact');
+      if (kontakt.includes('@')) email = kontakt; else phone = kontakt;
+    }
     const message = pick('zprava', 'message', 'popis poptavky', 'popis projektu', 'motiv', 'poznamka', 'dotaz');
 
     // Všechna ostatní (viditelná) pole půjdou do e-mailu jako tabulka
