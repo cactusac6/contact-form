@@ -234,6 +234,7 @@ function parseMultipart(req, contentType) {
     });
 
     bb.on('file', (name, stream, info) => {
+      if (!info.filename) { stream.resume(); return; } // prázdné pole přílohy (nic nevybráno) ignorovat
       fileCount += 1;
       if (fileCount > MAX_FILES) {
         tooManyFiles = true;
@@ -246,7 +247,7 @@ function parseMultipart(req, contentType) {
         oversizedFile = info.filename;
       });
       stream.on('end', () => {
-        if (!oversizedFile || oversizedFile !== info.filename) {
+        if ((!oversizedFile || oversizedFile !== info.filename) && chunks.length) {
           files.push({ field: name, filename: info.filename, mimetype: info.mimeType, buffer: Buffer.concat(chunks) });
         }
       });
